@@ -1,0 +1,451 @@
+ 
+#version 1
+import numpy as np                                       # numeric ops
+import pandas as pd                                      # dataframes / time handling
+import plotly.graph_objs as go                           # (import left in case you visualize later)
+import gradio as gr                                      # UI
+import ccxt                                              # exchange data
+import json                                              # json serialization
+import os                                                # os utilities (unused but kept)
+from datetime import datetime, timedelta                 # time math
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler   # feature transforms
+from xgboost import XGBRegressor, XGBClassifier          # models
+from sklearn.metrics import mean_squared_error, mean_absolute_error    # regression metrics
+from collections import defaultdict                      # utility (kept)
+import math                                              # math.sqrt etc.
+import time                                              # sleep on network errors
+
+# --- Initialize Exchange ---
+exchange = ccxt.kraken()                                 # create ccxt kraken instance (may require credentials for private calls)
+
+# ---------- SAFER INDICATOR FUNCTIONS ----------
+
+def calculate_bollinger_bands(prices, window=20, num_std=2):
+    """
+    Calculate Bollinger Bands (SMA, upper band, lower band) safely.
+    Returns (sma, upper, lower) as pandas.Series aligned with input index.
+    """
+    sma = prices.rolling(window=window, min_periods=1).mean()                          # simple moving average
+    std = prices.rolling(window=window, min_periods=1).std(ddof=0).fillna(0.0)         # rolling std (ddof=0 for population)
+    ub = sma + num_std * std                                                          # upper band
+    lb = sma - num_std * std                                                          # lower band
+    return sma.fillna(method='bfill'), ub.fillna(method='bfill'), lb.fillna(method='bfill')  # backfill any initial NaNs
+
+def calculate_rsi(prices, window=14, eps=1e-9):
+    """
+    Calculate RSI using Wilder-style EMA smoothing; returns Series aligned with prices.
+    """
+    delta = prices.diff()                                                              # price change per period
+    up = delta.clip(lower=0.0)                                                         # gains
+    down = -delta.clip(upper=0.0)                                                      # losses as positive values
+    ma_up = up.ewm(alpha=1.0/window, adjust=False, min_periods=1).mean()               # smoothed gains
+    ma_down = down.ewm(alpha=1.0/window, adjust=False, min_periods=1).mean()           # smoothed losses
+    rs = ma_up / (ma_down + eps)                                                       # relative strength
+    rsi = 100 - (100 / (1 + rs))                                                       # rsi formula
+    return rsi.fillna(50.0)                                                            # neutral initial value
+
+def calculate_stochastic(close, high, low, window=14, eps=1e-9):
+    """
+    Return %K stochastic oscillator (0-100). Safe with denom epsilon.
+    """
+    lowest = low.rolling(window=window, min_periods=1).min()                           # rolling lowest low
+    highest = high.rolling(window=window, min_periods=1).max()                        # rolling highest high
+    denom = (highest - lowest).replace(0, np.nan)                                      # avoid zero denom
+    k = 100.0 * (close - lowest) / (denom + eps)                                       # %K
+    return k.fillna(50.0)                                                              # neutral initial
+
+def calculate_atr(high, low, close, window=14):
+    """
+    Average True Range using simple rolling mean as a safe default.
+    """
+    tr1 = high - low                                                                   # high-low
+    tr2 = (high - close.shift()).abs()                                                 # high - prev_close
+    tr3 = (low - close.shift()).abs()                                                  # low - prev_close
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)                                # True range
+    atr = tr.rolling(window=window, min_periods=1).mean()                              # ATR as rolling mean
+    return atr.fillna(method='bfill').fillna(0.0)                                      # fill start values
+
+def calculate_obv(close, volume):
+    """
+    On-balance volume (OBV) standard: add volume on up, subtract on down, 0 on unchanged.
+    """
+    sign = np.sign(close.diff()).fillna(0.0)                                           # +1, -1 or 0
+    obv = (sign * volume).cumsum().fillna(0.0)                                         # cumulative OBV
+    return obv
+
+def calculate_adx(df, window=14, eps=1e-9):
+    """
+    Calculate ADX using smoothed DI and TR; returns ADX series.
+    Expects df to contain 'high','low','close' columns.
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0.0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0.0), 0.0)
+
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.rolling(window=window, min_periods=1).mean().fillna(method='bfill')
+
+    smooth_plus = plus_dm.rolling(window=window, min_periods=1).mean()
+    smooth_minus = minus_dm.rolling(window=window, min_periods=1).mean()
+
+    plus_di = 100.0 * (smooth_plus / (atr + eps))
+    minus_di = 100.0 * (smooth_minus / (atr + eps))
+
+    dx = 100.0 * ( (plus_di - minus_di).abs() / (plus_di + minus_di + eps) )
+    adx = dx.rolling(window=window, min_periods=1).mean()
+    return adx.fillna(0.0)
+
+def calculate_parabolic_sar(high, low, step=0.02, max_step=0.2):
+    """
+    Parabolic SAR implementation (safe for small series).
+    Returns pandas.Series aligned with input index.
+    """
+    n = len(high)
+    if n == 0:
+        return pd.Series(dtype=float)
+    if n == 1:
+        return pd.Series([low.iloc[0]], index=high.index)
+
+    sar = pd.Series(index=high.index, dtype=float)
+    # initial trend: examine first two closes if available
+    uptrend = True if high.iloc[1] > high.iloc[0] else False
+    sar.iloc[0] = low.iloc[0] if uptrend else high.iloc[0]
+    ep = high.iloc[0] if uptrend else low.iloc[0]   # extreme point
+    af = step                                        # acceleration factor
+
+    for i in range(1, n):
+        prev_sar = sar.iloc[i - 1]
+        sar_value = prev_sar + af * (ep - prev_sar)
+
+        if uptrend:
+            # keep SAR under last two lows if available
+            if i >= 2:
+                sar_value = min(sar_value, low.iloc[i-1], low.iloc[i-2])
+            else:
+                sar_value = min(sar_value, low.iloc[i-1])
+            if high.iloc[i] > ep:
+                ep = high.iloc[i]
+                af = min(af + step, max_step)
+            if low.iloc[i] < sar_value:
+                # reversal -> switch to downtrend
+                uptrend = False
+                sar_value = ep
+                ep = low.iloc[i]
+                af = step
+        else:
+            # downtrend: keep SAR above last highs
+            if i >= 2:
+                sar_value = max(sar_value, high.iloc[i-1], high.iloc[i-2])
+            else:
+                sar_value = max(sar_value, high.iloc[i-1])
+            if low.iloc[i] < ep:
+                ep = low.iloc[i]
+                af = min(af + step, max_step)
+            if high.iloc[i] > sar_value:
+                # reversal -> switch to uptrend
+                uptrend = True
+                sar_value = ep
+                ep = high.iloc[i]
+                af = step
+
+        sar.iloc[i] = sar_value
+
+    return sar.fillna(method='bfill')
+
+def calculate_tema(series, window=14):
+    """
+    Triple exponential moving average (TEMA) safe calculation.
+    """
+    ema1 = series.ewm(span=window, adjust=False).mean()
+    ema2 = ema1.ewm(span=window, adjust=False).mean()
+    ema3 = ema2.ewm(span=window, adjust=False).mean()
+    tema = 3.0 * ema1 - 3.0 * ema2 + ema3
+    return tema.fillna(method='bfill')
+
+def calculate_mfi(high, low, close, volume, window=14, eps=1e-9):
+    """
+    Money Flow Index (MFI) calculation.
+    """
+    typical_price = (high + low + close) / 3.0
+    money_flow = typical_price * volume
+    positive_flow = money_flow.where(typical_price > typical_price.shift(), 0.0)
+    negative_flow = money_flow.where(typical_price < typical_price.shift(), 0.0)
+    pos_mf_sum = positive_flow.rolling(window, min_periods=1).sum()
+    neg_mf_sum = negative_flow.rolling(window, min_periods=1).sum()
+    mfr = pos_mf_sum / (neg_mf_sum + eps)
+    mfi = 100.0 - (100.0 / (1.0 + mfr))
+    return mfi.fillna(50.0)
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """
+    MACD line, signal line, and histogram.
+    """
+    ema_fast = prices.ewm(span=fast, adjust=False).mean()
+    ema_slow = prices.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - macd_signal
+    return macd.fillna(0.0), macd_signal.fillna(0.0), macd_hist.fillna(0.0)
+
+# ---------- SAFER DATA FETCH ----------
+
+def fetch_crypto_data(symbol, timeframe='5m', lookback_days=1000):
+    """
+    Fetch OHLCV via ccxt with basic try/except and rate-limit behavior.
+    Returns a pandas.DataFrame with columns ['timestamp','open','high','low','close','volume'].
+    """
+    try:
+        # compute 'since' in milliseconds for ccxt
+        since = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since)                         # fetch OHLCV
+        if not ohlcv:
+            print(f"No OHLCV returned for {symbol} {timeframe} (lookback_days={lookback_days}).")
+            return pd.DataFrame(columns=['timestamp','open','high','low','close','volume'])
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])  # create df
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')                    # convert ms->datetime
+        for c in ['open','high','low','close','volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')                              # coerce to numeric
+        # drop rows with NaN for core OHLCV columns (safe)
+        df.dropna(subset=['open','high','low','close','volume'], inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+    except ccxt.NetworkError as e:
+        print("Network error fetching data:", str(e))
+        time.sleep(2)                                                                   # small backoff
+        return pd.DataFrame(columns=['timestamp','open','high','low','close','volume'])
+    except Exception as e:
+        print("Error fetching OHLCV:", str(e))
+        return pd.DataFrame(columns=['timestamp','open','high','low','close','volume'])
+
+# --- Timeframe to Frequency Mapping ---
+def timeframe_to_pandas_freq(tf):
+    """
+    Map common ccxt timeframe strings to pandas frequency strings for date_range usage.
+    """
+    mapping = {
+        '1m': '1min',
+        '3m': '3min',
+        '5m': '5min',
+        '15m': '15min',
+        '30m': '30min',
+        '1h': '1H',
+        '2h': '2H',
+        '4h': '4H',
+        '1d': '1D',
+        '1w': '1W'
+    }
+    return mapping.get(tf, '15min')
+
+# ---------- SAFER PREDICT FUNCTION (time-ordered split, no leakage) ----------
+
+def predict(symbol, timeframe, lookback_days=1000):
+    # Fetch data
+    df = fetch_crypto_data(symbol, timeframe, lookback_days)
+    if df.empty or len(df) < 60:
+        # not enough raw data
+        return None, "Not enough raw data for prediction.", ""
+
+    # Basic technical indicators
+    df['sma50'] = df['close'].rolling(window=50, min_periods=1).mean()                # SMA 50 as additional feature
+    sma, ub, lb = calculate_bollinger_bands(df['close'], window=20, num_std=2)        # bollinger components
+    df['sma_bb'] = sma
+    df['bb_upper'] = ub
+    df['bb_lower'] = lb
+
+    df['rsi'] = calculate_rsi(df['close'], window=14)                                # RSI
+    df['stochastic'] = calculate_stochastic(df['close'], df['high'], df['low'], window=14)  # Stochastic %K
+    df['atr'] = calculate_atr(df['high'], df['low'], df['close'], window=14)          # ATR
+    df['obv'] = calculate_obv(df['close'], df['volume'])                              # OBV
+    df['parabolic_sar'] = calculate_parabolic_sar(df['high'], df['low'])              # Parabolic SAR
+    df['adx'] = calculate_adx(df[['high','low','close']], window=14)                  # ADX
+    df['mfi'] = calculate_mfi(df['high'], df['low'], df['close'], df['volume'], window=14)  # MFI
+    df['tema'] = calculate_tema(df['close'], window=14)                               # TEMA
+    macd, macd_signal, macd_hist = calculate_macd(df['close'], fast=12, slow=26, signal=9)
+    df['macd'] = macd
+    df['macd_signal'] = macd_signal
+    df['macd_hist'] = macd_hist
+
+    # Base features to use (explicit ordering)
+    base_features = [
+        'sma_bb', 'bb_upper', 'bb_lower', 'rsi', 'stochastic', 'atr',
+        'obv', 'parabolic_sar', 'adx', 'mfi', 'tema', 'macd', 'macd_signal', 'macd_hist'
+    ]
+
+    # Create lag features deterministically (lag1, lag2, lag3)
+    for bf in base_features:
+        if bf in df.columns:
+            df[f"{bf}_lag1"] = df[bf].shift(1)
+            df[f"{bf}_lag2"] = df[bf].shift(2)
+            df[f"{bf}_lag3"] = df[bf].shift(3)
+
+    # Drop any rows with NaNs created by indicator calculation or lagging (keeps deterministic behavior)
+    df.dropna(inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    if len(df) < 40:
+        return None, "Not enough data after indicator calculation.", ""
+
+    # Build stable feature list in explicit order (feature, lag1, lag2, lag3)
+    features = []
+    for bf in base_features:
+        if bf in df.columns:
+            features.append(bf)
+            features.append(f"{bf}_lag1")
+            features.append(f"{bf}_lag2")
+            features.append(f"{bf}_lag3")
+
+    # Label: next candle direction (1 if next close > current close)
+    df['label'] = (df['close'].shift(-1) > df['close']).astype(int)
+    df = df.iloc[:-1].copy()  # remove last row which lacks next-close label
+    df.reset_index(drop=True, inplace=True)
+
+    # Train / Test split (time-ordered)
+    train_frac = 0.8
+    n = len(df)
+    train_end = int(n * train_frac)
+    if train_end < 5:
+        return None, "Not enough train data.", ""
+
+    # Prepare matrices
+    X = df[features].values                                                       # technical features matrix
+    y_class = df['label'].values                                                   # classification labels (direction)
+    y_reg = df['close'].values                                                     # regression target (price)
+
+    # ===== CLASSIFIER =====
+    scaler_clf = StandardScaler()                                                  # scaler for classifier
+    X_train_clf = scaler_clf.fit_transform(X[:train_end])                         # fit on training portion only
+    X_test_clf = scaler_clf.transform(X[train_end:])                              # transform test portion
+
+    y_train_clf = y_class[:train_end]
+    y_test_clf = y_class[train_end:]
+
+    clf = XGBClassifier(n_estimators=200, learning_rate=0.05, verbosity=0, random_state=42, use_label_encoder=False)
+    clf.fit(X_train_clf, y_train_clf)                                              # train classifier
+
+    # Predict on most recent row (last row) using classifier
+    X_last_clf = scaler_clf.transform(X[-1:].copy())
+    pred_label = int(clf.predict(X_last_clf)[0])                                  # predicted class (0/1)
+
+    # Safely extract probability for predicted label
+    prob = 0.0
+    try:
+        proba_all = clf.predict_proba(X_last_clf)[0]                               # probabilities for all classes
+        # find index of predicted class within the classifier's classes_ ordering
+        try:
+            class_index = list(clf.classes_).index(pred_label)
+            prob = float(proba_all[class_index])
+        except Exception:
+            prob = float(np.max(proba_all))                                        # fallback to max prob
+    except Exception:
+        # if predict_proba not available or fails, fallback to 1.0 (best-effort)
+        prob = 1.0
+
+    direction = "UP" if pred_label == 1 else "DOWN"
+    clf_summary = f"Predicted Direction: {direction}\nConfidence: {prob*100:.2f}%"
+
+    # ===== REGRESSOR =====
+    # time index polynomial (deterministic)
+    ts = np.arange(len(df)).reshape(-1, 1)                                         # time index for each row after trimming
+    poly = PolynomialFeatures(degree=3)                                           # polynomial features on time
+    X_ts = poly.fit_transform(ts)                                                  # time polynomial matrix
+
+    # scale technical features separately for the regressor
+    scaler_reg = StandardScaler()
+    X_tech = df[features].values
+    X_tech_train = scaler_reg.fit_transform(X_tech[:train_end])
+    X_tech_test = scaler_reg.transform(X_tech[train_end:])
+
+    # combine polynomial time features and scaled technical features for regressor
+    X_reg_train = np.hstack([X_ts[:train_end], X_tech_train])
+    X_reg_test = np.hstack([X_ts[train_end:], X_tech_test])
+    y_reg_train = y_reg[:train_end]
+    y_reg_test = y_reg[train_end:]
+
+    if X_reg_test.shape[0] == 0:
+        return None, "Not enough test data for regression evaluation.", ""
+
+    reg = XGBRegressor(n_estimators=200, learning_rate=0.05, verbosity=0, random_state=42)
+    reg.fit(X_reg_train, y_reg_train)                                              # train regressor
+
+    # Evaluate on up to last 10 test points
+    n_eval = min(10, X_reg_test.shape[0])
+    y_pred_test = reg.predict(X_reg_test[:n_eval])
+    mse = mean_squared_error(y_reg_test[:n_eval], y_pred_test)
+    mae = mean_absolute_error(y_reg_test[:n_eval], y_pred_test)
+    rmse = math.sqrt(mse)
+    nrmse_percent = (rmse / (np.mean(y_reg_test[:n_eval]) + 1e-9)) * 100.0
+
+    # Future 1-step prediction: use next time index + last observed tech features
+    future_steps = 1
+    future_ts = np.arange(len(df), len(df) + future_steps).reshape(-1,1)
+    future_poly = poly.transform(future_ts)
+
+    last_tech = X_tech[-1].reshape(1, -1)                                          # last observed technical features
+    future_tech_scaled = scaler_reg.transform(last_tech)                           # scale using training scaler
+    future_X = np.hstack([future_poly, future_tech_scaled])
+    future_pred = reg.predict(future_X)                                            # 1-step price prediction
+
+    # Build summary text
+    quality = "Super Duper Bad"
+    if nrmse_percent < 3.0:
+        quality = "Bad"
+    if nrmse_percent < 1.0:
+        quality = "Good"
+    if nrmse_percent < 0.5:
+        quality = "Excellent"
+
+    last_price = df['close'].iloc[-1]
+    delta = float(future_pred[0] - last_price)
+    arrow = "▲" if delta > 0 else "▼"
+
+    summary_lines = [
+        f".......................................",
+        f"Prediction Quality: {nrmse_percent:.2f}% → {quality}",
+        f"RMSE: {rmse:.6f}, MAE: {mae:.6f}"
+    ]
+
+    # Compose human-friendly future time for the predicted step (safe fallback to current time)
+    try:
+        # create a 2-entry date range and take the second as the future step
+        future_time = pd.date_range(df['timestamp'].iloc[-1], periods=future_steps+1, freq=timeframe_to_pandas_freq(timeframe))[1]
+        summary_lines.append(f"1. {future_time.strftime('%Y-%m-%d %H:%M')} → {future_pred[0]:.6f} USD ({arrow} {delta:+.6f})")
+    except Exception:
+        # fallback if timestamp frequency mapping fails
+        summary_lines.append(f"1. (future) → {future_pred[0]:.6f} USD ({arrow} {delta:+.6f})")
+
+    combined_summary = f"{clf_summary}\n\n" + "\n".join(summary_lines)
+
+    # Hidden JSON payload for downstream usage (e.g. deep-linking, debugging)
+    hidden_payload = json.dumps({'symbol': symbol, 'timeframe': timeframe, 'predicted_price': float(future_pred[0]), 'pred_direction': direction, 'confidence': float(prob)})
+
+    return combined_summary, hidden_payload
+
+# --- UI with Gradio ---
+kraken_symbols = ["BTC/USD", "TRX/USD", "SOL/USD", "ADA/USD"]                       # dropdown choices
+
+# Close any running Gradio apps (useful in interactive dev environments)
+gr.close_all()
+
+# Build Gradio interface using Blocks API
+with gr.Blocks() as app:
+    symbol = gr.Dropdown(choices=kraken_symbols, label="Symbol", value="BTC/USD")    # symbol dropdown
+    timeframe = gr.Dropdown(choices=['1m','5m', '15m','30m', '1h','4h', '1d', '1w'], label="Select Timeframe", value='15m')  # timeframe dropdown
+    btn = gr.Button("Predict")                                                       # predict button
+    summary = gr.Textbox(label="Prediction Summary", lines=15)                       # visible summary output
+    hidden = gr.Textbox(visible=False)                                               # hidden payload output for programmatic use
+    feedback = gr.Textbox(visible=False)                                             # reserved (unused)
+
+    # wire button to predict function; function returns (summary_text, hidden_json)
+    btn.click(fn=predict, inputs=[symbol, timeframe], outputs=[summary, hidden])
+
+# Launch the Gradio app (use share=True if you need a public link)
+app.launch()
